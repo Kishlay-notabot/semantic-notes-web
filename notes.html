@@ -409,8 +409,10 @@
    The optional model is EmbeddingGemma 2 (text tower only) via transformers.js.
    ========================================================================== */
 
-const GITHUB_URL = 'https://github.com/Kishlay-notabot/semantic-notes-web';
+const GITHUB_URL = 'https://github.com/Kishlay-notabot/semantic-notes-web'; // TODO: put your GitHub repo link here
 const STORAGE_KEY = 'semantic-notes:v1';
+const LOADING_FLAG = 'sn:model-loading';
+const MAX_NOTE_CHARS = 200000;
 const VEC_PREFIX = 'sn:vec:';
 const TAGVEC_PREFIX = 'sn:tagvec:';
 const MODEL_ID = 'onnx-community/embeddinggemma-2-ONNX';
@@ -1058,19 +1060,31 @@ async function isModelCached(dtype) {
   }
 }
 
-async function embedRaw(text) {
+// One inference at a time: the indexer, search and tag scoring share one
+// session, and overlapping runs spike memory (and throw on WebGPU).
+let embedChain = Promise.resolve();
+function embedRaw(text) {
+  const run = embedChain.then(() => embedRawNow(text));
+  embedChain = run.catch(() => {});
+  return run;
+}
+
+async function embedRawNow(text) {
   if (!embedder) throw new Error('Model is not loaded.');
-  const inputs = await embedder.tokenizer([text], {
-    padding: true,
-    truncation: true,
-    max_length: 512,
-  });
-  const out = await embedder.model(inputs);
-  const tensor = out?.sentence_embedding;
-  if (!tensor || typeof tensor.tolist !== 'function') {
-    throw new Error('The model returned no sentence embedding.');
+  let inputs = null, out = null;
+  try {
+    inputs = await embedder.tokenizer([text], { padding: true, truncation: true, max_length: 512 });
+    out = await embedder.model(inputs);
+    const tensor = out?.sentence_embedding;
+    if (!tensor || typeof tensor.tolist !== 'function') {
+      throw new Error('The model returned no sentence embedding.');
+    }
+    return normalize(Float32Array.from(tensor.tolist()[0]));
+  } finally {
+    for (const o of [inputs, out]) {
+      for (const t of Object.values(o || {})) { try { t?.dispose?.(); } catch { /* ignore */ } }
+    }
   }
-  return normalize(Float32Array.from(tensor.tolist()[0]));
 }
 
 async function embedText(text) {
@@ -1127,7 +1141,14 @@ async function attemptLoad(tf, device, dtype) {
   }
 }
 
-async function loadModel({ device = null, dtype = null, allowFallback = true } = {}) {
+async function loadModel(opts = {}) {
+  if (modelState.status === 'downloading' || modelState.status === 'loading') return;
+  try { localStorage.setItem(LOADING_FLAG, '1'); } catch { /* ignore */ }
+  try { await loadModelInner(opts); }
+  finally { try { localStorage.removeItem(LOADING_FLAG); } catch { /* ignore */ } }
+}
+
+async function loadModelInner({ device = null, dtype = null, allowFallback = true } = {}) {
   if (modelState.status === 'downloading' || modelState.status === 'loading') return;
   modelState.status = 'downloading';
   modelState.error = null;
@@ -1189,6 +1210,18 @@ async function deleteModel() {
 /** Load in the background on every visit so smart features are simply there. */
 async function autoLoadModel() {
   if (modelState.status === 'downloading' || modelState.status === 'loading' || modelState.status === 'ready') return;
+  // If the tab died while loading last time (usually out of memory), don't loop.
+  try {
+    if (localStorage.getItem(LOADING_FLAG)) {
+      localStorage.removeItem(LOADING_FLAG);
+      showToast('Smart search paused: the model didn’t finish loading last time, possibly low memory.', [{ label: 'Settings', fn: () => openSettings('model') }], 9000);
+      return;
+    }
+  } catch { /* ignore */ }
+  if (navigator.deviceMemory && navigator.deviceMemory <= 2) {
+    showToast('Smart search is off on low-memory devices. You can still download the model in Settings.', [{ label: 'Settings', fn: () => openSettings('model') }], 9000);
+    return;
+  }
   // Probing picks WebGPU/f16 when available and reuses the browser cache.
   loadModel({ device: null, dtype: null });
 }
@@ -1316,7 +1349,7 @@ async function runIndexer() {
       }
 
       state.queue = state.queue.filter((q) => q !== entry);
-      saveState(true);
+      saveState();
 
       try {
         await applyAutoTags(note, vec, state.settings.demoActive);
@@ -1324,7 +1357,7 @@ async function runIndexer() {
         console.warn('Auto-tagging failed', note.id, e);
       }
 
-      renderList();
+      renderListSoon();
       renderIndexNotice();
       await sleep(12);
     } catch (e) {
@@ -1621,7 +1654,7 @@ function noteCard(note, opts = {}) {
   const autoIds = new Set(refs.filter((r) => r.source === 'auto').map((r) => r.tag_id));
   const text = note.content.trim();
   const urlOnly = isUrl(text);
-  const preview = urlOnly ? displayDomain(text) : text;
+  const preview = urlOnly ? displayDomain(text) : text.slice(0, 600);
   const metaTags = tags.slice(0, 3).map((t) =>
     `<span class="meta-tag"><span class="dot" style="background:${t.color}"></span>${escapeHtml(t.name)}${state.settings.showAutoBadge && autoIds.has(t.id) ? ' <span class="auto-badge">suggested</span>' : ''}</span>`
   ).join('');
@@ -1955,6 +1988,10 @@ async function updateNote(id, content) {
   const text = String(content ?? '').trim();
   if (!text) {
     deleteNote(id);
+    return false;
+  }
+  if (text.length > MAX_NOTE_CHARS) {
+    showToast(`That note is too long (max ${MAX_NOTE_CHARS.toLocaleString()} characters).`);
     return false;
   }
   if (text === note.content) return true;
@@ -2755,6 +2792,7 @@ async function applyImport(data, replace) {
 
 function handleImportFile(file) {
   if (!file) return;
+  if (file.size > 25e6) { showToast('That file is too large to import (max 25 MB).'); return; }
   const reader = new FileReader();
   reader.onload = () => {
     let data;
@@ -2847,6 +2885,10 @@ async function saveFromDock() {
   if (!ta) return;
   const text = ta.value;
   if (!text.trim()) return;
+  if (text.length > MAX_NOTE_CHARS) {
+    showToast(`That note is too long (max ${MAX_NOTE_CHARS.toLocaleString()} characters). Split it up.`);
+    return;
+  }
   ta.value = '';
   autoGrowCapture();
   const note = await createNote(text);
@@ -3191,6 +3233,13 @@ function showSelfTests() {
 
 async function boot() {
   seedFirstRun();
+  // A queue entry still marked "running" means the tab died mid-embedding.
+  for (const q of state.queue) {
+    if (q.status === 'running') {
+      q.attempts = (q.attempts || 0) + 1;
+      q.status = q.attempts >= MAX_ATTEMPTS ? 'failed' : 'queued';
+    }
+  }
   discardBlankNotes();
   loadVectors();
   await ensureHashes();
@@ -3238,6 +3287,9 @@ document.addEventListener('keydown', (e) => {
 $('#searchInput')?.addEventListener('blur', () => {
   if (!$('#searchInput').value.trim()) setTimeout(() => $('#searchWrap')?.classList.add('hidden'), 150);
 });
+
+const renderListSoon = debounce(() => renderList(), 400);
+window.addEventListener('pagehide', () => { try { localStorage.removeItem(LOADING_FLAG); } catch { /* ignore */ } });
 
 boot().catch((e) => {
   console.error('Failed to start', e);
